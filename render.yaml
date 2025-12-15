@@ -4,5 +4,5 @@ services:
     env: node
     plan: free
     buildCommand: "npm install"
-    startCommand: "npx tsx src/main.ts"   # pour TypeScript direct sans compiler
+    startCommand: "npx tsx src/main.ts"  # pour TypeScript direct sans compiler
     autoDeploy: true
