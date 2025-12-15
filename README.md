@@ -1,9 +1,25 @@
-# Getting started with Crawlee
+# Web Scraping Jumia API
 
-This example uses `PlaywrightCrawler` to recursively crawl https://crawlee.dev using the browser automation library [Playwright](https://playwright.dev).
+## Description
+Ce projet est une API permettant de récupérer les informations des produits depuis le site **Jumia** via le **web scraping**. Les données sont stockées dans une base de données **MongoDB** en utilisant **Mongoose**, et elles sont accessibles via des endpoints **RESTful**.
 
-You can find more examples and documentation at the following links:
+L'objectif est de fournir un accès rapide et structuré aux informations des produits.
 
-- [Step-by-step tutorial](https://crawlee.dev/js/docs/introduction) for Crawlee
-- `PlaywrightCrawler` [API documentation](https://crawlee.dev/js/api/playwright-crawler/class/PlaywrightCrawler)
-- Other [examples](https://crawlee.dev/js/docs/examples/playwright-crawler)
+---
+
+## Fonctionnalités
+- Scraping automatique des produits depuis Jumia.
+- Stockage des données dans MongoDB.
+- Endpoint `/products` pour la recherche, le filtrage et la pagination.
+- Protection par clé API (`x-rapidapi-key`).
+- Limitation du nombre de requêtes (Rate limiting).
+- Pagination et option `all` pour récupérer tous les produits.
+
+---
+
+## Installation
+
+1. Cloner le projet :
+```bash
+git clone https://github.com/Moufidzakaria/api-scraping.git
+cd api-scraping
