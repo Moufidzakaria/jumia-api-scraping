@@ -1,0 +1,7 @@
+app = "jumia-api-scraping"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "4000"
