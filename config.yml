@@ -1,0 +1,7 @@
+tunnel: jumia-api
+credentials-file: /home/zakaria/.cloudflared/02d01f3d-b9a1-4c67-891a-2d581755c7d9.json
+
+ingress:
+  - hostname: api.myjumia.com
+    service: http://localhost:4000
+  - service: http_status:404

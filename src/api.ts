@@ -1,86 +1,168 @@
 import express from 'express';
-import fs from 'fs';
 import mongoose from 'mongoose';
-import rateLimit from 'express-rate-limit';
 import cors from 'cors';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
+import { randomUUID } from 'crypto';
+import 'dotenv/config';
+import { PlaywrightCrawler } from 'crawlee';
+import Redis from 'ioredis';
 
-const MONGO_URI = 'mongodb://127.0.0.1:27017/jumia_api'; // بدلها بالـ URI ديالك
+// ================== INIT ==================
+const app = express();
+const PORT = process.env.PORT || 4000;
+app.use(express.json());
 
-// 🔹 Connect to MongoDB
-await mongoose.connect(MONGO_URI);
-console.log('✅ MongoDB connected');
+// ====== SECURITE ======
+app.use(cors());
+app.use(helmet());
+app.use(rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 60
+}));
 
-// 🔹 Create Product model
+// ================== DB ==================
+await mongoose.connect(process.env.MONGO_URI as string);
+console.log('✅ MongoDB connecté');
+
+// ================== REDIS ==================
+const redis = new Redis(process.env.REDIS_URL);
+redis.on('connect', () => console.log('✅ Redis connecté'));
+redis.on('error', (err) => console.error('❌ Redis error:', err));
+
+// ================== SCHEMA ==================
 const productSchema = new mongoose.Schema({
+  id: { type: String, unique: true },
   title: String,
   price: String,
   image: String,
-  url: String,
+  url: { type: String, unique: true },
   sourcePage: String,
+  createdAt: Date,
 }, { timestamps: true });
 
 const Product = mongoose.model('Product', productSchema);
 
-// 🔹 Import products.json to MongoDB (once)
-const productsCount = await Product.countDocuments();
-if (productsCount === 0) {
-  const products = JSON.parse(fs.readFileSync('./products.json', 'utf-8'));
-  await Product.insertMany(products);
-  console.log(`✅ Imported ${products.length} products to MongoDB`);
-} else {
-  console.log('ℹ️ Products already exist in MongoDB, skipping import');
-}
-
-// 🔹 Express setup
-const app = express();
-app.use(cors());
-app.use(express.json());
-
-// 🛡️ Rate limit
-const limiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 100,
-});
-app.use(limiter);
-
-// ✅ /products endpoint with search, pagination, all
-app.get('/products', async (req, res) => {
-  const { q, page = 1, limit = 20 } = req.query;
-
-  const filter: any = {};
-  if (q) filter.title = { $regex: q, $options: 'i' };
-
-  // "all" option
-  if (limit === 'all') {
-    const data = await Product.find(filter);
-    return res.json({ total: data.length, data });
-  }
-
-  const data = await Product.find(filter)
-    .skip((Number(page) - 1) * Number(limit))
-    .limit(Number(limit));
-
-  const total = await Product.countDocuments(filter);
-
-  res.json({
-    total,
-    page: Number(page),
-    limit: limit === 'all' ? total : Number(limit),
-    data,
-  });
-});
-
+// ================== API Key Middleware ==================
 app.use((req, res, next) => {
-  const apiKey = req.headers['x-rapidapi-key'];
-  if (!apiKey || apiKey !== process.env.MY_KEY) {
-    return res.status(401).json({ message: 'Unauthorized' });
-  }
+  const apiKey = req.header('x-api-key');
+  if (apiKey !== process.env.MY_KEY) return res.status(401).json({ error: 'Unauthorized' });
   next();
 });
 
+// ================== ROUTES ==================
 
-// 🚀 Start server
-const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => {
-  console.log(`🚀 API running on http://localhost:${PORT}`);
+// GET all products
+app.get('/produit', async (req, res) => {
+  try {
+    const products = await Product.find().sort({ createdAt: -1 });
+    res.json(products);
+  } catch (err) {
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
 });
+
+// GET product by ID
+app.get('/produit/:id', async (req, res) => {
+  try {
+    const product = await Product.findOne({ id: req.params.id });
+    if (!product) return res.status(404).json({ error: 'Produit non trouvé' });
+    res.json(product);
+  } catch (err) {
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// GET products by price
+app.get('/produit/price/:price', async (req, res) => {
+  try {
+    const price = req.params.price;
+    const products = await Product.find({ price: new RegExp(price, 'i') });
+    res.json(products);
+  } catch (err) {
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+app.post('/scraping', async (req, res) => {
+  try {
+    // Vérifier cache Redis
+    const cache = await redis.get('products');
+    if (cache) {
+      return res.json({
+        message: 'Données depuis le cache Redis',
+        total: JSON.parse(cache).length,
+        products: JSON.parse(cache),
+      });
+    }
+
+    const urls = Array.from({ length: 7 }, (_, i) =>
+      `https://www.jumia.ma/catalog/?q=pc+portable+hp&page=${i + 1}`
+    );
+
+    const results: any[] = [];
+
+    const crawler = new PlaywrightCrawler({
+      maxRequestsPerCrawl: urls.length,
+      launchContext: { launchOptions: { headless: true } },
+      async requestHandler({ page, request, log }) {
+        log.info(`Scraping ${request.url}`);
+        await page.waitForSelector('article.prd', { timeout: 20000 });
+
+        const productsFromPage = await page.$$eval('article.prd', items =>
+          items.map(item => ({
+            title: item.querySelector('h3.name')?.textContent?.trim(),
+            price: item.querySelector('div.prc')?.textContent?.trim(),
+            image: item.querySelector('img')?.getAttribute('data-src') ||
+                   item.querySelector('img')?.getAttribute('src'),
+            url: item.querySelector('a.core')?.href,
+            sourcePage: location.href,
+          }))
+        );
+
+        const products = productsFromPage.map(p => ({
+          ...p,
+          id: randomUUID(),
+          createdAt: new Date(),
+        }));
+
+        for (const product of products) {
+          if (!product.url) continue;
+
+          await Product.updateOne(
+            { url: product.url },
+            {
+              $set: {
+                title: product.title,
+                price: product.price,
+                image: product.image,
+                sourcePage: product.sourcePage,
+              },
+              $setOnInsert: {
+                id: product.id,
+                createdAt: product.createdAt,
+              },
+            },
+            { upsert: true }
+          );
+
+          results.push(product);
+        }
+
+        log.info(`✅ ${products.length} produits traités`);
+      },
+    });
+
+    await crawler.run(urls);
+
+    // Stocker dans Redis pour 1h (3600s)
+    await redis.set('products', JSON.stringify(results), 'EX', 3600);
+
+    res.json({ message: 'Scraping terminé et sauvegardé dans Redis', total: results.length, products: results });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erreur lors du scraping' });
+  }
+});
+
+// ================== START SERVER ==================
+app.listen(PORT, () => console.log(`🚀 Serveur démarré sur http://localhost:${PORT}`));
