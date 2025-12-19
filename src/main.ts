@@ -35,14 +35,18 @@ const crawler = new PlaywrightCrawler({
     log.info(`Scraping ${request.url}`);
     await page.waitForSelector('article.prd', { timeout: 20000 });
 
-    const productsFromPage = await page.$$eval('article.prd', items =>
-      items.map(item => ({
-        title: item.querySelector('h3.name')?.textContent?.trim(),
-        price: item.querySelector('div.prc')?.textContent?.trim(),
-        image: item.querySelector('img')?.getAttribute('data-src') || item.querySelector('img')?.getAttribute('src'),
-        url: item.querySelector('a.core')?.href,
-        sourcePage: location.href,
-      }))
+    // Passe l'URL de la page comme argument pour éviter 'location.href'
+    const productsFromPage = await page.$$eval(
+      'article.prd',
+      (items, pageUrl) =>
+        items.map(item => ({
+          title: item.querySelector('h3.name')?.textContent?.trim() || '',
+          price: item.querySelector('div.prc')?.textContent?.trim() || '',
+          image: item.querySelector('img')?.getAttribute('data-src') || item.querySelector('img')?.getAttribute('src') || '',
+          url: (item.querySelector('a.core') as HTMLAnchorElement)?.href || '',
+          sourcePage: pageUrl
+        })),
+      request.url
     );
 
     const products = productsFromPage.map(p => ({
@@ -56,8 +60,18 @@ const crawler = new PlaywrightCrawler({
 
       await Product.updateOne(
         { url: product.url },
-        { $set: { title: product.title, price: product.price, image: product.image, sourcePage: product.sourcePage },
-          $setOnInsert: { id: product.id, createdAt: product.createdAt } },
+        {
+          $set: {
+            title: product.title,
+            price: product.price,
+            image: product.image,
+            sourcePage: product.sourcePage
+          },
+          $setOnInsert: {
+            id: product.id,
+            createdAt: product.createdAt
+          }
+        },
         { upsert: true }
       );
 

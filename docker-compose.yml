@@ -1,0 +1,52 @@
+version: '3.9'
+
+services:
+  app:
+    build: .
+    container_name: jumia-api
+    restart: always
+    ports:
+      - "4001:4000"  # Host 4001 -> Container 4000
+    env_file:
+      - .env
+    depends_on:
+      - mongo
+      - redis
+
+  scraper:
+    build: .
+    container_name: jumia-scraper
+    restart: "no"    # Scraper tourne une seule fois
+    command: ["node", "dist/main.js"]
+    env_file:
+      - .env
+    depends_on:
+      - mongo
+      - redis
+
+  mongo:
+    image: mongo:7
+    container_name: jumia-mongo
+    restart: always
+    ports:
+      - "27018:27017"
+    environment:
+      MONGO_INITDB_DATABASE: jumia
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: example
+    volumes:
+      - mongo-data:/data/db
+
+  redis:
+    image: redis:8
+    container_name: jumia-redis
+    restart: always
+    ports:
+      - "6380:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+
+volumes:
+  mongo-data:
+  redis-data:
