@@ -17,7 +17,7 @@ COPY . .
 RUN npx tsc
 
 # Exposer le port de l'API
-EXPOSE 4000
+EXPOSE 4001
 
 # Commande par défaut pour lancer l'API
 CMD ["node", "dist/api.js"]
