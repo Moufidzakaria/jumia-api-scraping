@@ -5,6 +5,18 @@ app = "jumia-api-scraping"
 
 [env]
   PORT = "4001"
-  MONGO_URI = "mongodb+srv://...:...@cluster0.mipcfte.mongodb.net/jumia?retryWrites=true&w=majority"
+  MONGO_URI = "mongodb+srv://USER:PASSWORD@cluster0.mipcfte.mongodb.net/jumia?retryWrites=true&w=majority"
   MY_KEY = "ta_clef_rapide"
-  REDIS_URL = "rediss://default:...@sure-ostrich-25743.upstash.io:6379"
+  REDIS_URL = "rediss://default:PASSWORD@sure-ostrich-25743.upstash.io:6379"
+
+[[services]]
+  internal_port = 4001
+  protocol = "tcp"
+
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
