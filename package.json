@@ -4,6 +4,7 @@
     "type": "module",
     "description": "This is an example of a Crawlee project.",
     "dependencies": {
+        "compression": "^1.8.1",
         "cors": "^2.8.5",
         "crawlee": "^3.15.3",
         "dotenv": "^17.2.3",
@@ -20,6 +21,7 @@
     },
     "devDependencies": {
         "@apify/tsconfig": "^0.1.1",
+        "@types/compression": "^1.8.1",
         "@types/cors": "^2.8.19",
         "@types/express": "^5.0.6",
         "@types/node": "^24.10.4",
