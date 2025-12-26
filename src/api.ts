@@ -8,7 +8,7 @@ import compression from 'compression';
 import 'dotenv/config';
 
 const app = express();
-const PORT = process.env.PORT ? Number(process.env.PORT) : 4001;
+const PORT = process.env.PORT ? Number(process.env.PORT) : 8080;
 
 // ===== MIDDLEWARES =====
 app.use(express.json());
@@ -25,60 +25,36 @@ app.use(rateLimit({
 const redis = process.env.REDIS_URL ? new Redis(process.env.REDIS_URL) : null;
 if (redis) {
   redis.on('connect', () => console.log('✅ Redis connecté'));
-  redis.on('error', (err) => console.error('❌ Redis error (ignored):', err.message));
+  redis.on('error', (err) => console.error('❌ Redis error:', err.message));
 }
 
-// ===== MongoDB Schema =====
+// ===== MongoDB Schema المحسن (مع category و priceNumber) =====
 const productSchema = new mongoose.Schema({
   id: { type: String, unique: true },
   title: String,
   price: String,
+  priceNumber: Number,
   image: String,
   url: { type: String, unique: true },
   sourcePage: String,
+  category: String,
   createdAt: Date,
 }, { timestamps: true });
 
+// Indexes للبحث السريع
+productSchema.index({ title: 'text' });
+productSchema.index({ category: 1 });
+productSchema.index({ priceNumber: 1 });
+
 const Product = mongoose.models.Product || mongoose.model('Product', productSchema);
 
-// ===== RapidAPI Key + Plan + Quota Middleware =====
-app.use(async (req: Request, res: Response, next: NextFunction) => {
+// ===== RapidAPI Plan Detection (الطريقة الصحيحة) =====
+app.use((req: Request, _res: Response, next: NextFunction) => {
   if (req.path === '/ping') return next();
 
-  const rapidApiKey = req.headers['x-rapidapi-key'] as string;
-  if (!rapidApiKey) return res.status(401).json({ error: 'Unauthorized - RapidAPI only' });
-
-  // Mapping des clés vers Plans
-  const planMapping: Record<string, string> = {
-    'key_basic': 'BASIC',
-    'key_pro': 'PRO',
-    'key_ultra': 'ULTRA',
-    'key_mega': 'MEGA'
-  };
-  const plan = planMapping[rapidApiKey];
-  if (!plan) return res.status(403).json({ error: 'Invalid RapidAPI key' });
-
-  (req as any).plan = plan;
-
-  // Quota par Plan
-  const planQuota: Record<string, number> = {
-    BASIC: 500,
-    PRO: 5000,
-    ULTRA: 30000,
-    MEGA: 100000,
-  };
-
-  if (redis) {
-    const countStr = await redis.get(`quota:${rapidApiKey}`);
-    const count: number = countStr ? parseInt(countStr, 10) : 0;
-
-    if (count >= planQuota[plan]) {
-      return res.status(429).json({ error: `Quota exceeded for ${plan} plan` });
-    }
-
-    await redis.incr(`quota:${rapidApiKey}`);
-    await redis.expire(`quota:${rapidApiKey}`, 30 * 24 * 60 * 60); // reset chaque 30 jours
-  }
+  const subscription = req.headers['x-rapidapi-subscription'] as string;
+  const plan = subscription ? subscription.toUpperCase() : 'BASIC';
+  (req as any).plan = plan; // BASIC, PRO, ULTRA, MEGA
 
   next();
 });
@@ -88,25 +64,28 @@ app.get('/ping', (_req, res) => {
   res.json({ status: 'ok', uptime: process.uptime(), timestamp: Date.now() });
 });
 
-// GET /produit avec cache + transformation plan
-app.get('/produit', async (_req, res) => {
+// 1. Get Latest Products (مع plan-based data)
+app.get('/produit', async (req: Request, res: Response) => {
   try {
-    const plan = (_req as any).plan;
-    const cacheKey = `produits:list:${plan}`;
+    const plan = (req as any).plan;
+    const cacheKey = `latest:${plan}`;
+
     if (redis) {
       const cached = await redis.get(cacheKey);
       if (cached) return res.json(JSON.parse(cached));
     }
 
-    const products = await Product.find().sort({ createdAt: -1 }).limit(100);
+    const products = await Product.find()
+      .sort({ createdAt: -1 })
+      .limit(plan === 'BASIC' ? 20 : plan === 'PRO' ? 50 : 100);
 
-    const transformed = products.map(p => {
-      let obj: any = { id: p.id, title: p.title };
-      if (plan !== 'BASIC') { obj.price = p.price; obj.image = p.image; obj.url = p.url; }
-      if (plan === 'MEGA') obj.sourcePage = p.sourcePage;
-      obj.plan = plan;
-      return obj;
-    });
+    const transformed = products.map(p => ({
+      id: p.id,
+      title: p.title,
+      ...(plan !== 'BASIC' && { price: p.price, image: p.image, url: p.url, category: p.category }),
+      ...(plan === 'MEGA' && { sourcePage: p.sourcePage }),
+      plan
+    }));
 
     if (redis) await redis.setex(cacheKey, 60, JSON.stringify(transformed));
 
@@ -116,11 +95,12 @@ app.get('/produit', async (_req, res) => {
   }
 });
 
-// GET /produit/:id
-app.get('/produit/:id', async (req, res) => {
+// 2. Get Product by ID
+app.get('/produit/:id', async (req: Request, res: Response) => {
   try {
     const plan = (req as any).plan;
     const cacheKey = `produit:${req.params.id}:${plan}`;
+
     if (redis) {
       const cached = await redis.get(cacheKey);
       if (cached) return res.json(JSON.parse(cached));
@@ -129,108 +109,98 @@ app.get('/produit/:id', async (req, res) => {
     const product = await Product.findOne({ id: req.params.id });
     if (!product) return res.status(404).json({ error: 'Produit non trouvé' });
 
-    let obj: any = { id: product.id, title: product.title };
-    if (plan !== 'BASIC') { obj.price = product.price; obj.image = product.image; obj.url = product.url; }
-    if (plan === 'MEGA') obj.sourcePage = product.sourcePage;
-    obj.plan = plan;
+    const transformed = {
+      id: product.id,
+      title: product.title,
+      ...(plan !== 'BASIC' && { price: product.price, image: product.image, url: product.url, category: product.category }),
+      ...(plan === 'MEGA' && { sourcePage: product.sourcePage }),
+      plan
+    };
 
-    if (redis) await redis.setex(cacheKey, 120, JSON.stringify(obj));
+    if (redis) await redis.setex(cacheKey, 300, JSON.stringify(transformed));
 
-    res.json(obj);
-  } catch (err) {
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// GET /produit/search/:name
-app.get('/produit/search/:name', async (req, res) => {
-  try {
-    const plan = (req as any).plan;
-    const nameQuery = req.params.name.toLowerCase();
-    const cacheKey = `produit:search:${nameQuery}:${plan}`;
-
-    if (redis) {
-      const cached = await redis.get(cacheKey);
-      if (cached) return res.json(JSON.parse(cached));
-    }
-
-    const products = await Product.find({ title: { $regex: nameQuery, $options: 'i' } })
-      .sort({ createdAt: -1 }).limit(50);
-
-    const transformed = products.map(p => {
-      let obj: any = { id: p.id, title: p.title };
-      if (plan !== 'BASIC') { obj.price = p.price; obj.image = p.image; obj.url = p.url; }
-      if (plan === 'MEGA') obj.sourcePage = p.sourcePage;
-      obj.plan = plan;
-      return obj;
-    });
-
-    if (redis) await redis.setex(cacheKey, 60, JSON.stringify(transformed));
     res.json(transformed);
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
   }
 });
 
-// GET /produit/price/:price
-app.get('/produit/price/:price', async (req, res) => {
-  try {
-    const plan = (req as any).plan;
-    const priceParam = Number(req.params.price);
-    if (isNaN(priceParam)) return res.status(400).json({ error: 'Price doit être un nombre valide' });
-
-    const cacheKey = `produit:price:${priceParam}:${plan}`;
-    if (redis) {
-      const cached = await redis.get(cacheKey);
-      if (cached) return res.json(JSON.parse(cached));
-    }
-
-    const products = await Product.find({ price: priceParam }).sort({ createdAt: -1 }).limit(50);
-
-    const transformed = products.map(p => {
-      let obj: any = { id: p.id, title: p.title };
-      if (plan !== 'BASIC') { obj.price = p.price; obj.image = p.image; obj.url = p.url; }
-      if (plan === 'MEGA') obj.sourcePage = p.sourcePage;
-      obj.plan = plan;
-      return obj;
-    });
-
-    if (redis) await redis.setex(cacheKey, 60, JSON.stringify(transformed));
-    res.json(transformed);
-  } catch (err) {
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// GET /produit/search/:name/price/:price
-app.get('/produit/search/:name/price/:price', async (req, res) => {
+// 3. Search by Name
+app.get('/produit/search/:name', async (req: Request, res: Response) => {
   try {
     const plan = (req as any).plan;
     const nameQuery = req.params.name.toLowerCase();
-    const priceParam = Number(req.params.price);
-    if (isNaN(priceParam)) return res.status(400).json({ error: 'Price doit être un nombre valide' });
+    const cacheKey = `search:${nameQuery}:${plan}`;
 
-    const cacheKey = `produit:searchprice:${nameQuery}:${priceParam}:${plan}`;
     if (redis) {
       const cached = await redis.get(cacheKey);
       if (cached) return res.json(JSON.parse(cached));
     }
 
     const products = await Product.find({
-      title: { $regex: nameQuery, $options: 'i' },
-      price: priceParam
-    }).sort({ createdAt: -1 }).limit(50);
+      title: { $regex: nameQuery, $options: 'i' }
+    }).sort({ createdAt: -1 }).limit(plan === 'BASIC' ? 20 : 50);
 
-    const transformed = products.map(p => {
-      let obj: any = { id: p.id, title: p.title };
-      if (plan !== 'BASIC') { obj.price = p.price; obj.image = p.image; obj.url = p.url; }
-      if (plan === 'MEGA') obj.sourcePage = p.sourcePage;
-      obj.plan = plan;
-      return obj;
-    });
+    const transformed = products.map(p => ({
+      id: p.id,
+      title: p.title,
+      ...(plan !== 'BASIC' && { price: p.price, image: p.image, url: p.url, category: p.category }),
+      ...(plan === 'MEGA' && { sourcePage: p.sourcePage }),
+      plan
+    }));
 
     if (redis) await redis.setex(cacheKey, 60, JSON.stringify(transformed));
+
     res.json(transformed);
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// 4. Price Range (الأقوى!)
+app.get('/produit/price-range', async (req: Request, res: Response) => {
+  try {
+    const plan = (req as any).plan;
+    const min = Number(req.query.min);
+    const max = Number(req.query.max);
+
+    if (isNaN(min) || isNaN(max) || min < 0 || max < min) {
+      return res.status(400).json({ error: 'min و max لازم يكونو أرقام صحيحة و min ≤ max' });
+    }
+
+    const cacheKey = `price-range:${min}-${max}:${plan}`;
+    if (redis) {
+      const cached = await redis.get(cacheKey);
+      if (cached) return res.json(JSON.parse(cached));
+    }
+
+    const limit = plan === 'BASIC' ? 20 : plan === 'PRO' ? 50 : 100;
+
+    const products = await Product.find({
+      priceNumber: { $gte: min, $lte: max }
+    }).sort({ createdAt: -1 }).limit(limit);
+
+    const transformed = products.map(p => ({
+      id: p.id,
+      title: p.title,
+      ...(plan !== 'BASIC' && { price: p.price, image: p.image, url: p.url, category: p.category }),
+      ...(plan === 'MEGA' && { sourcePage: p.sourcePage }),
+      plan
+    }));
+
+    if (redis) await redis.setex(cacheKey, 120, JSON.stringify(transformed));
+
+    res.json(transformed);
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// 5. Get Categories
+app.get('/produit/categories', async (_req: Request, res: Response) => {
+  try {
+    const categories = await Product.distinct('category');
+    res.json({ categories: categories.filter(c => c && c !== 'Autre') });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
   }
@@ -242,7 +212,10 @@ async function startServer() {
     if (!process.env.MONGO_URI) throw new Error('MONGO_URI manquant');
     await mongoose.connect(process.env.MONGO_URI);
     console.log('✅ MongoDB connecté');
-    app.listen(PORT, '0.0.0.0', () => console.log(`🚀 API running on port ${PORT}`));
+
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`🚀 API running on port ${PORT} - Jumia Scraper Ready for RapidAPI!`);
+    });
   } catch (err: any) {
     console.error('❌ Startup error:', err.message);
     process.exit(1);
