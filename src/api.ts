@@ -7,198 +7,275 @@ import Redis from 'ioredis';
 import compression from 'compression';
 import 'dotenv/config';
 
+/* ================== APP ================== */
 const app = express();
 const PORT = process.env.PORT ? Number(process.env.PORT) : 8080;
 
-// ===== MIDDLEWARES =====
-app.use(express.json());
+/* ✅ REQUIRED FOR Fly.io + RapidAPI */
+app.set('trust proxy', 1);
+
+app.disable('x-powered-by');
+app.use(express.json({ limit: '1mb' }));
 app.use(cors());
 app.use(helmet());
 app.use(compression());
-app.use(rateLimit({
-  windowMs: 60 * 1000,
-  max: 100,
-  message: { error: 'Too many requests, please try again later.' },
-}));
 
-// ===== Redis (Fail-safe pour Fly.io) =====
-let redis: Redis.Redis | null = null;
+app.use(
+  rateLimit({
+    windowMs: 60 * 1000,
+    max: 100,
+    standardHeaders: true,
+    legacyHeaders: false,
+  })
+);
+
+/* ================== REDIS (SAFE) ================== */
+let redis: Redis | null = null;
+
 if (process.env.REDIS_URL) {
-  redis = new Redis(process.env.REDIS_URL);
-  redis.on('connect', () => console.log('✅ Redis connecté'));
-  redis.on('error', (err) => console.error('❌ Redis error:', err.message));
+  try {
+    redis = new Redis(process.env.REDIS_URL, {
+      lazyConnect: true,
+      retryStrategy: times => Math.min(times * 50, 2000),
+    });
+
+    redis.on('connect', () => console.log('✅ Redis connected'));
+    redis.on('error', err => {
+      console.warn('⚠️ Redis error:', err.message);
+      redis = null;
+    });
+
+    redis.connect().catch(() => {
+      redis = null;
+    });
+  } catch {
+    redis = null;
+  }
 }
 
-// ===== MongoDB Schema =====
-const productSchema = new mongoose.Schema({
-  id: { type: String, unique: true },
-  title: String,
-  price: String,
-  priceNumber: Number,
-  image: String,
-  url: { type: String, unique: true },
-  sourcePage: String,
-  category: String,
-  createdAt: Date,
-}, { timestamps: true });
+/* ================== MONGODB ================== */
+const productSchema = new mongoose.Schema(
+  {
+    id: { type: String, required: true, unique: true, index: true },
+    title: { type: String, required: true, trim: true },
+    price: { type: String, required: true },
+    priceNumber: { type: Number, required: true, index: true },
+    image: String,
+    url: { type: String, unique: true },
+    sourcePage: String,
+    category: { type: String, default: 'Autre', index: true },
+  },
+  { timestamps: true, versionKey: false }
+);
 
 productSchema.index({ title: 'text' });
-productSchema.index({ category: 1 });
-productSchema.index({ priceNumber: 1 });
+productSchema.index({ createdAt: -1 });
 
-const Product = mongoose.models.Product || mongoose.model('Product', productSchema);
+const Product =
+  mongoose.models.Product || mongoose.model('Product', productSchema);
 
-// ===== RapidAPI Plan Detection =====
+/* ================== UTILS ================== */
+function parsePrice(price: string): number {
+  return Number(price.replace(/[^\d]/g, ''));
+}
+
+async function getCachedOrDb(
+  key: string,
+  fn: () => Promise<any>,
+  ttl = 60
+) {
+  try {
+    if (redis) {
+      const cached = await redis.get(key);
+      if (cached) return JSON.parse(cached);
+    }
+
+    const data = await fn();
+
+    if (redis && data) {
+      await redis.setex(key, ttl, JSON.stringify(data));
+    }
+
+    return data;
+  } catch {
+    return fn();
+  }
+}
+
+/* ================== RAPIDAPI PLAN ================== */
 app.use((req: Request, _res: Response, next: NextFunction) => {
   if (req.path === '/ping') return next();
-  const subscription = req.headers['x-rapidapi-subscription'] as string;
-  const plan = subscription ? subscription.toUpperCase() : 'BASIC';
+  const plan =
+    ((req.headers['x-rapidapi-subscription'] as string) || 'BASIC').toUpperCase();
   (req as any).plan = plan;
   next();
 });
 
-// ===== Routes =====
-app.get('/ping', (_req, res) => {
-  res.json({ status: 'ok', uptime: process.uptime(), timestamp: Date.now() });
-});
-
+/* ================== TRANSFORM ================== */
 const transformProduct = (p: any, plan: string) => ({
   id: p.id,
   title: p.title,
-  ...(plan !== 'BASIC' && { price: p.price, image: p.image, url: p.url, category: p.category }),
+  ...(plan !== 'BASIC' && {
+    price: p.price,
+    image: p.image,
+    url: p.url,
+    category: p.category,
+  }),
   ...(plan === 'MEGA' && { sourcePage: p.sourcePage }),
-  plan
 });
 
-// 1. Latest Products
+/* ================== ROUTES ================== */
+app.get('/ping', (_req, res) =>
+  res.json({ status: 'ok', uptime: process.uptime() })
+);
+
+/* 🔐 ADMIN INSERT (protected by secret key) */
+app.post('/produit', async (req: Request, res: Response) => {
+  if (req.headers['x-admin-key'] !== process.env.ADMIN_KEY)
+    return res.status(401).json({ error: 'unauthorized' });
+
+  try {
+    const { id, title, price, image, url, sourcePage, category } = req.body;
+
+    if (!id || !title || !price)
+      return res.status(400).json({ error: 'missing fields' });
+
+    const priceNumber = parsePrice(price);
+    if (!priceNumber)
+      return res.status(400).json({ error: 'invalid price' });
+
+    await Product.updateOne(
+      { id },
+      {
+        $set: {
+          title,
+          price,
+          priceNumber,
+          image,
+          url,
+          sourcePage,
+          category: category || 'Autre',
+        },
+      },
+      { upsert: true }
+    );
+
+    res.status(201).json({ success: true });
+  } catch {
+    res.status(500).json({ error: 'server error' });
+  }
+});
+
+/* 🔹 LATEST PRODUCTS */
 app.get('/produit', async (req: Request, res: Response) => {
-  try {
-    const plan = (req as any).plan;
-    const cacheKey = `latest:${plan}`;
+  const plan = (req as any).plan;
+  const limit = plan === 'BASIC' ? 20 : plan === 'PRO' ? 50 : 100;
 
-    if (redis) {
-      const cached = await redis.get(cacheKey);
-      if (cached) return res.json(JSON.parse(cached));
-    }
+  const data = await getCachedOrDb(
+    `latest:${plan}`,
+    () => Product.find().sort({ createdAt: -1 }).limit(limit).lean(),
+    60
+  );
 
-    const products = await Product.find().sort({ createdAt: -1 })
-      .limit(plan === 'BASIC' ? 20 : plan === 'PRO' ? 50 : 100);
-
-    const transformed = products.map(p => transformProduct(p, plan));
-
-    if (redis) await redis.setex(cacheKey, 60, JSON.stringify(transformed));
-
-    res.json(transformed);
-  } catch {
-    res.status(500).json({ error: 'Server error' });
-  }
+  res.json(data.map((p: any) => transformProduct(p, plan)));
 });
 
-// 2. Product by ID
+/* 🔹 PRODUCT BY ID */
 app.get('/produit/:id', async (req: Request, res: Response) => {
-  try {
-    const plan = (req as any).plan;
-    const cacheKey = `produit:${req.params.id}:${plan}`;
+  const plan = (req as any).plan;
 
-    if (redis) {
-      const cached = await redis.get(cacheKey);
-      if (cached) return res.json(JSON.parse(cached));
-    }
+  const product = await getCachedOrDb(
+    `p:${req.params.id}:${plan}`,
+    () => Product.findOne({ id: req.params.id }).lean(),
+    300
+  );
 
-    const product = await Product.findOne({ id: req.params.id });
-    if (!product) return res.status(404).json({ error: 'Produit non trouvé' });
-
-    const transformed = transformProduct(product, plan);
-
-    if (redis) await redis.setex(cacheKey, 300, JSON.stringify(transformed));
-
-    res.json(transformed);
-  } catch {
-    res.status(500).json({ error: 'Server error' });
-  }
+  if (!product) return res.status(404).json({ error: 'not found' });
+  res.json(transformProduct(product, plan));
 });
 
-// 3. Search by Name
+/* 🔹 SEARCH */
 app.get('/produit/search/:name', async (req: Request, res: Response) => {
-  try {
-    const plan = (req as any).plan;
-    const nameQuery = req.params.name.toLowerCase();
-    const cacheKey = `search:${nameQuery}:${plan}`;
+  const plan = (req as any).plan;
+  const limit = plan === 'BASIC' ? 20 : 50;
 
-    if (redis) {
-      const cached = await redis.get(cacheKey);
-      if (cached) return res.json(JSON.parse(cached));
-    }
+  const data = await getCachedOrDb(
+    `search:${req.params.name}:${plan}`,
+    () =>
+      Product.find({ $text: { $search: req.params.name } })
+        .sort({ createdAt: -1 })
+        .limit(limit)
+        .lean(),
+    60
+  );
 
-    const products = await Product.find({ title: { $regex: nameQuery, $options: 'i' } })
-      .sort({ createdAt: -1 })
-      .limit(plan === 'BASIC' ? 20 : 50);
-
-    const transformed = products.map(p => transformProduct(p, plan));
-
-    if (redis) await redis.setex(cacheKey, 60, JSON.stringify(transformed));
-
-    res.json(transformed);
-  } catch {
-    res.status(500).json({ error: 'Server error' });
-  }
+  res.json(data.map((p: any) => transformProduct(p, plan)));
 });
-
-// 4. Price Range
 app.get('/produit/price-range', async (req: Request, res: Response) => {
+  const plan = (req as any).plan || 'BASIC';
+  const min = parseFloat(req.query.min as string);
+  const max = parseFloat(req.query.max as string);
+
+  if (isNaN(min) || isNaN(max) || min > max)
+    return res.status(400).json({ error: 'invalid range' });
+
+  const limit = plan === 'BASIC' ? 20 : plan === 'PRO' ? 50 : 100;
+  const cacheKey = `range:${min}-${max}:${plan}`;
+
   try {
-    const plan = (req as any).plan;
-    const min = Number(req.query.min);
-    const max = Number(req.query.max);
+    const data = await getCachedOrDb(cacheKey, async () =>
+      Product.find({ priceNumber: { $gte: min, $lte: max } })
+        .sort({ createdAt: -1 })
+        .limit(limit)
+        .lean()
+    , 120);
 
-    if (isNaN(min) || isNaN(max) || min < 0 || max < min)
-      return res.status(400).json({ error: 'min et max doivent être valides' });
+    res.json(data.map((p: any) => transformProduct(p, plan)));
+  } catch (err: any) {
+    console.error('Error /price-range:', err.message);
+    res.status(500).json({ error: 'server error' });
+  }
+});
+app.get('/produit/categories', async (req: Request, res: Response) => {
+  const plan = (req as any).plan || 'BASIC';
+  const cacheKey = `categories:${plan}`;
 
-    const cacheKey = `price-range:${min}-${max}:${plan}`;
+  try {
+    let categories: string[] = [];
+
     if (redis) {
       const cached = await redis.get(cacheKey);
-      if (cached) return res.json(JSON.parse(cached));
+      if (cached) return res.json({ categories: JSON.parse(cached) });
     }
 
+    categories = (await Product.distinct('category')).filter(Boolean);
+
+    // Limite selon plan
     const limit = plan === 'BASIC' ? 20 : plan === 'PRO' ? 50 : 100;
-    const products = await Product.find({ priceNumber: { $gte: min, $lte: max } })
-      .sort({ createdAt: -1 })
-      .limit(limit);
+    categories = categories.slice(0, limit);
 
-    const transformed = products.map(p => transformProduct(p, plan));
+    if (redis) await redis.setex(cacheKey, 600, JSON.stringify(categories));
 
-    if (redis) await redis.setex(cacheKey, 120, JSON.stringify(transformed));
-
-    res.json(transformed);
-  } catch {
-    res.status(500).json({ error: 'Server error' });
+    res.json({ categories });
+  } catch (err: any) {
+    console.error('Error /categories:', err.message);
+    res.status(500).json({ error: 'server error' });
   }
 });
 
-// 5. Categories
-app.get('/produit/categories', async (_req, res) => {
-  try {
-    const categories = await Product.distinct('category');
-    res.json({ categories: categories.filter(c => c && c !== 'Autre') });
-  } catch {
-    res.status(500).json({ error: 'Server error' });
-  }
-});
 
-// ===== Start Server =====
-async function startServer() {
+/* ================== START ================== */
+(async () => {
   try {
-    if (!process.env.MONGO_URI) throw new Error('MONGO_URI manquant');
+    if (!process.env.MONGO_URI) throw new Error('MONGO_URI missing');
     await mongoose.connect(process.env.MONGO_URI);
-    console.log('✅ MongoDB connecté');
+    console.log('✅ MongoDB connected');
 
-    app.listen(PORT, '0.0.0.0', () => {
-      console.log(`🚀 API running on port ${PORT} - Ready for RapidAPI`);
-    });
+    app.listen(PORT, '0.0.0.0', () =>
+      console.log(`🚀 API running on port ${PORT}`)
+    );
   } catch (err: any) {
     console.error('❌ Startup error:', err.message);
     process.exit(1);
   }
-}
-
-startServer();
+})();
